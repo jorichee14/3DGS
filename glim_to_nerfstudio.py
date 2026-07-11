@@ -40,10 +40,13 @@ def pose_from_tq(tx, ty, tz, qx, qy, qz, qw):
     T[:3, 3] = [tx, ty, tz]
     return T
 
-# >>> EDIT these numbers with your lidar<-camera extrinsic <<<
+# >>> lidar<-camera extrinsic, from direct_visual_lidar_calibration <<<
+# resources/mirc_dataset_calib_20260706/calibration.json -> results.T_lidar_camera
+# Format there is [tx,ty,tz, qx,qy,qz,qw]; "T_lidar_camera" already means
+# p_lidar = T @ p_cam, which is exactly what pose_from_tq expects -> no invert.
 T_LIDAR_CAM = pose_from_tq(
-    0.0, 0.0, 0.0,        # translation  (meters)
-    0.0, 0.0, 0.0, 1.0,   # quaternion   (x, y, z, w)
+    -0.07492821535373663, -0.06697097901204006, -0.09162651926397122,  # translation (m)
+    -0.4978291081882739, -0.4980354235251849, 0.501788779666838, 0.502329490031218,  # qx,qy,qz,qw
 )
 INVERT_EXTRINSIC = False
 
