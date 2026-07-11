@@ -1,0 +1,18 @@
+# ROS 2 bag data (huge, binary — never commit)
+*.db3
+*.mcap
+
+# Dataset resources (bags, maps, trajectories live on the robot, not in git)
+resources/
+
+# Converter output + training artifacts
+out/
+outputs/
+export/
+*.ply
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
