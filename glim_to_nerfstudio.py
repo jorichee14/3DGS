@@ -116,9 +116,14 @@ def decode_image(msg):
 
 def read_bag(bag_path, image_topic, caminfo_topic):
     from rosbags.highlevel import AnyReader
+    from rosbags.typesys import Stores, get_typestore
+
+    # ROS 2 Humble sqlite3 bags don't embed message definitions, so newer rosbags
+    # versions need an explicit typestore to deserialize the standard msg types.
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
 
     frames, intr = [], None
-    with AnyReader([Path(bag_path)]) as reader:
+    with AnyReader([Path(bag_path)], default_typestore=typestore) as reader:
         wanted = {image_topic, caminfo_topic}
         conns = [c for c in reader.connections if c.topic in wanted]
         if not any(c.topic == image_topic for c in conns):
