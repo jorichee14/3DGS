@@ -122,7 +122,7 @@ def read_bag(bag_path, image_topic, caminfo_topic):
     # versions need an explicit typestore to deserialize the standard msg types.
     typestore = get_typestore(Stores.ROS2_HUMBLE)
 
-    frames, intr = [], None
+    frames, intr, img_frame = [], None, None
     with AnyReader([Path(bag_path)], default_typestore=typestore) as reader:
         wanted = {image_topic, caminfo_topic}
         conns = [c for c in reader.connections if c.topic in wanted]
@@ -137,9 +137,89 @@ def read_bag(bag_path, image_topic, caminfo_topic):
                             w=int(msg.width), h=int(msg.height))
             elif conn.topic == image_topic:
                 t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                if img_frame is None:
+                    img_frame = msg.header.frame_id
                 frames.append((t, decode_image(msg)))
     frames.sort(key=lambda f: f[0])
-    return frames, intr
+    return frames, intr, img_frame
+
+
+# ----------------------------------------------------------------------------
+# Camera-only pose source: read poses from a nav_msgs/Odometry topic (e.g. ZED
+# VIO) plus /tf_static to relate the odom body frame to the image optical frame.
+# No LiDAR, no GLIM, no COLMAP.
+# ----------------------------------------------------------------------------
+def read_odom_tf(bag_path, odom_topic, tf_static_topic):
+    from rosbags.highlevel import AnyReader
+    from rosbags.typesys import Stores, get_typestore
+
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    times, poses, child_frame = [], [], None
+    static = {}  # (parent, child) -> T_parent_child   (p_parent = T @ p_child)
+    with AnyReader([Path(bag_path)], default_typestore=typestore) as reader:
+        conns = [c for c in reader.connections
+                 if c.topic in (odom_topic, tf_static_topic)]
+        if not any(c.topic == odom_topic for c in conns):
+            raise SystemExit(f"Odom topic '{odom_topic}' not found in bag.")
+        for conn, _, raw in tqdm(reader.messages(connections=conns), desc="reading odom/tf"):
+            msg = reader.deserialize(raw, conn.msgtype)
+            if conn.topic == odom_topic:
+                t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                if child_frame is None:
+                    child_frame = msg.child_frame_id
+                p = msg.pose.pose
+                times.append(t)
+                poses.append(pose_from_tq(p.position.x, p.position.y, p.position.z,
+                                          p.orientation.x, p.orientation.y,
+                                          p.orientation.z, p.orientation.w))
+            else:  # /tf_static — one message may carry many transforms
+                for tf in msg.transforms:
+                    tr, q = tf.transform.translation, tf.transform.rotation
+                    T = pose_from_tq(tr.x, tr.y, tr.z, q.x, q.y, q.z, q.w)
+                    static[(tf.header.frame_id, tf.child_frame_id)] = T
+    times = np.asarray(times)
+    order = np.argsort(times)
+    times = times[order]
+    poses = np.asarray(poses)[order]
+    keep = np.concatenate(([True], np.diff(times) > 0))
+    return times[keep], poses[keep], child_frame, static
+
+
+def lookup_tf(static, source, target):
+    """Return T (p_source = T @ p_target) by walking the static-TF graph."""
+    if source == target:
+        return np.eye(4)
+    # directed edges both ways: edge[(a,b)] = T_a<-b
+    edge = {}
+    for (parent, child), T in static.items():
+        edge[(parent, child)] = T
+        edge[(child, parent)] = np.linalg.inv(T)
+    # BFS for a path source -> target
+    from collections import deque
+    nbrs = {}
+    for (a, b) in edge:
+        nbrs.setdefault(a, []).append(b)
+    prev, q = {source: None}, deque([source])
+    while q:
+        cur = q.popleft()
+        if cur == target:
+            break
+        for nxt in nbrs.get(cur, []):
+            if nxt not in prev:
+                prev[nxt] = cur
+                q.append(nxt)
+    if target not in prev:
+        frames = sorted({f for e in static for f in e})
+        raise SystemExit(f"No TF path {source} -> {target}. Known frames: {frames}")
+    # reconstruct path source..target and compose T = prod edge[(fi, fi+1)]
+    path = [target]
+    while path[-1] != source:
+        path.append(prev[path[-1]])
+    path.reverse()
+    T = np.eye(4)
+    for a, b in zip(path[:-1], path[1:]):
+        T = T @ edge[(a, b)]
+    return T
 
 
 # ----------------------------------------------------------------------------
@@ -209,8 +289,16 @@ def build_map_from_lidar(bag_path, lidar_topic, interp, voxel, stride):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bag", required=True, help="ROS 2 bag directory")
-    ap.add_argument("--traj", required=True, help="GLIM traj_lidar.txt")
     ap.add_argument("--out", required=True, help="output dataset directory")
+    # --- pose source: exactly one of these ---
+    ap.add_argument("--traj", help="GLIM traj_lidar.txt (LiDAR pose source)")
+    ap.add_argument("--odom-topic",
+                    help="nav_msgs/Odometry topic for camera-only poses "
+                         "(e.g. /zed/zed_node/odom). Uses /tf_static to reach the "
+                         "image optical frame. Mutually exclusive with --traj.")
+    ap.add_argument("--tf-static-topic", default="/tf_static",
+                    help="static-TF topic used to relate the odom body frame to "
+                         "the image optical frame (odom mode only)")
     ap.add_argument("--map-ply", help="GLIM exported map .ply (init cloud)")
     ap.add_argument("--build-map", action="store_true",
                     help="build the init cloud from the bag's LiDAR + trajectory "
@@ -228,17 +316,30 @@ def main():
                     help="voxel size (m) to downsample the init cloud; 0 disables")
     args = ap.parse_args()
 
+    if bool(args.traj) == bool(args.odom_topic):
+        raise SystemExit("Give exactly one pose source: --traj (GLIM) OR --odom-topic (camera-only).")
+
     out = Path(args.out)
     (out / "images").mkdir(parents=True, exist_ok=True)
 
-    ext = np.linalg.inv(T_LIDAR_CAM) if INVERT_EXTRINSIC else T_LIDAR_CAM
-
-    times, poses = load_tum(args.traj)
-    interp = TrajInterpolator(times, poses)
-    frames, intr = read_bag(args.bag, args.image_topic, args.caminfo_topic)
+    frames, intr, img_frame = read_bag(args.bag, args.image_topic, args.caminfo_topic)
     if intr is None:
         raise SystemExit(f"No camera_info on '{args.caminfo_topic}'. "
                          "Point --caminfo-topic at the rectified left topic.")
+
+    if args.traj:
+        # LiDAR/GLIM: interpolate T_world_lidar, extrinsic maps optical -> lidar.
+        ext = np.linalg.inv(T_LIDAR_CAM) if INVERT_EXTRINSIC else T_LIDAR_CAM
+        times, poses = load_tum(args.traj)
+        interp = TrajInterpolator(times, poses)
+    else:
+        # Camera-only: interpolate T_odom_body, extrinsic = body <- image optical (from TF).
+        times, poses, child_frame, static = read_odom_tf(
+            args.bag, args.odom_topic, args.tf_static_topic)
+        interp = TrajInterpolator(times, poses)
+        ext = lookup_tf(static, child_frame, img_frame)
+        print(f"odom child frame '{child_frame}', image frame '{img_frame}'")
+        print(f"resolved body<-optical extrinsic:\n{np.round(ext, 4)}")
 
     json_frames, last_pos, kept, skipped = [], None, 0, 0
     for t, img in tqdm(frames, desc="posing frames"):
@@ -294,8 +395,11 @@ def main():
     (out / "transforms.json").write_text(json.dumps(meta, indent=2))
     print(f"\nkept {kept} frames, skipped {skipped} (outside trajectory).")
     print(f"dataset -> {out}")
-    print(f"train:  ns-train splatfacto --data {out} "
-          f"nerfstudio-data --load-3D-points True")
+    if "ply_file_path" in meta:
+        print(f"train:  ns-train splatfacto --data {out} "
+              f"nerfstudio-data --load-3D-points True")
+    else:
+        print(f"train:  ns-train splatfacto --data {out}   # random init (no point cloud)")
 
 
 if __name__ == "__main__":
