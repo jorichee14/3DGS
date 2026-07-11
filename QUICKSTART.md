@@ -140,10 +140,40 @@ your GLIM `map.ply` (positions only — training freely moves/splits/prunes them
 ## Step 4 — Export & view
 
 ```bash
-ns-export gaussian-splat --load-config outputs/.../config.yml --output-dir ./export
+# grabs the latest run's config automatically:
+ns-export gaussian-splat --load-config $(ls -t outputs/out/splatfacto/*/config.yml | head -1) --output-dir ./export
 ```
-Drop the exported `.ply` into a web viewer (SuperSplat, antimatter15, Luma), or
+Writes `export/splat.ply`. Drop it into a web viewer (SuperSplat, antimatter15, Luma), or
 `ns-render` a fly-through video.
+
+---
+
+## Torch 2.7 compatibility — every papercut in one place
+
+nerfstudio 1.1.5 predates torch ≥2.6, so a fresh install hits four unrelated failures.
+All four were hit (and fixed) on the mirc run; here they are with their one-line cures.
+
+| # | Symptom | Cause | Fix |
+|---|---------|-------|-----|
+| 1 | `AnyReaderError: Bag contains no type definitions` | Humble sqlite3 bags don't embed msg defs; newer `rosbags` needs a typestore | Already patched in `glim_to_nerfstudio.py` (passes `Stores.ROS2_HUMBLE`) |
+| 2 | `std_function.h: parameter packs not expanded with '...'` (×hundreds) | System `nvcc` (e.g. 11.5) too old for GCC 11, and mismatched with torch's CUDA | `conda install -c nvidia/label/cuda-11.8.0 cuda-toolkit`; `export CUDA_HOME=$CONDA_PREFIX` before `ns-train` |
+| 3 | gsplat compile takes 15+ min | Builds for every GPU arch | `export TORCH_CUDA_ARCH_LIST="8.6"` (your card's compute cap) |
+| 4 | Training freezes at **Step 0** | `torch.compile`/inductor stalls | `export TORCHDYNAMO_DISABLE=1` |
+| 5 | `ns-export`: `UnpicklingError: Weights only load failed … numpy.core.multiarray.scalar` | torch 2.6 flipped `torch.load` to `weights_only=True`; blocks numpy globals in the checkpoint | Patch the one `torch.load` in nerfstudio (checkpoint is your own → trusted): see below |
+
+**#5 fix** (run once per env):
+```bash
+F=$(python -c "import nerfstudio.utils.eval_utils as m; print(m.__file__)")
+sed -i 's/torch.load(load_path, map_location="cpu")/torch.load(load_path, map_location="cpu", weights_only=False)/' "$F"
+```
+
+**Per-terminal env** (items 2–4) — set these before every `ns-train`/`ns-export` in a new shell:
+```bash
+export CUDA_HOME=$CONDA_PREFIX
+export PATH=$CUDA_HOME/bin:$PATH
+export TORCH_CUDA_ARCH_LIST="8.6"
+export TORCHDYNAMO_DISABLE=1
+```
 
 ---
 
