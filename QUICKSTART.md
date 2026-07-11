@@ -87,14 +87,53 @@ you targeted the wrong camera frame (body vs left-optical).
 ## Step 3 — Train (needs a CUDA GPU)
 
 ```bash
-# install nerfstudio + gsplat. Skip tiny-cuda-nn (splatfacto doesn't need it).
-# IMPORTANT: your torch CUDA version must match system nvcc (gsplat JIT-compiles).
-pip install nerfstudio
+# use an isolated conda env (keeps this off system Python / ROS 2 deps):
+conda create -n gsplat python=3.10 -y && conda activate gsplat
 
+# install nerfstudio + gsplat. Skip tiny-cuda-nn (splatfacto doesn't need it).
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install nerfstudio
+```
+
+### Environment gotchas that WILL bite you (all hit on the mirc run — fixes baked in here)
+
+gsplat JIT-compiles its CUDA kernels on the first `ns-train`. Three things break that:
+
+1. **System `nvcc` too old for GCC 11** → hundreds of
+   `std_function.h: parameter packs not expanded with '...'` errors. Cause: torch built
+   for CUDA 11.8 but system `/usr/bin/nvcc` was 11.5. **Fix: put a matching CUDA toolkit
+   inside the conda env and point the build at it:**
+   ```bash
+   conda install -c "nvidia/label/cuda-11.8.0" cuda-toolkit -y   # match torch.version.cuda
+   export CUDA_HOME=$CONDA_PREFIX
+   export PATH=$CUDA_HOME/bin:$PATH
+   rm -rf ~/.cache/torch_extensions        # wipe any half-built kernels
+   which nvcc                              # must point into the conda env, not /usr/bin
+   ```
+2. **Compile takes 15+ min** because it builds for every GPU arch. **Fix: target only your
+   card** (RTX 3080 = 8.6) → ~2–3 min:
+   ```bash
+   export TORCH_CUDA_ARCH_LIST="8.6"       # find yours: nvidia-smi --query-gpu=compute_cap --format=csv
+   ```
+3. **Training freezes at Step 0** after kernels build — `torch.compile`/inductor stalls on
+   newer torch. **Fix: disable it:**
+   ```bash
+   export TORCHDYNAMO_DISABLE=1
+   ```
+
+Then train:
+```bash
+ns-train splatfacto --data ./out
+# quality run, once you have the GLIM map.ply (see Step 1):
 ns-train splatfacto --data ./out nerfstudio-data --load-3D-points True
 ```
 Live viewer at **http://localhost:7007**. `--load-3D-points True` seeds Gaussians from
 your GLIM `map.ply` (positions only — training freely moves/splits/prunes them).
+
+> **Verifying the extrinsic in the viewer:** the train-camera frustums should form one
+> **continuous path** through the scene and the interior should look like your real space
+> (text readable, not mirrored). A scrambled ball of frustums / permanent fog = wrong
+> extrinsic → flip `INVERT_EXTRINSIC` and re-run the converter.
 
 ---
 
