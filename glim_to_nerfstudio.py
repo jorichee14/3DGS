@@ -143,12 +143,82 @@ def read_bag(bag_path, image_topic, caminfo_topic):
 
 
 # ----------------------------------------------------------------------------
+# Build the init point cloud straight from the bag's LiDAR + GLIM trajectory,
+# so you don't need to separately export a map from GLIM. Each scan is posed by
+# the interpolated T_world_lidar(t), accumulated, voxel-downsampled, cleaned.
+# ----------------------------------------------------------------------------
+def decode_pointcloud2_xyz(msg):
+    """Extract finite XYZ (float32) from a sensor_msgs/PointCloud2."""
+    fields = {f.name: f for f in msg.fields}
+    for k in ("x", "y", "z"):
+        if k not in fields:
+            raise ValueError(f"PointCloud2 has no '{k}' field; fields={list(fields)}")
+    n = int(msg.width) * int(msg.height)
+    buf = np.frombuffer(msg.data, dtype=np.uint8).reshape(n, msg.point_step)
+
+    def col(field):  # datatype 7 == FLOAT32
+        off = field.offset
+        return buf[:, off:off + 4].copy().view(np.float32).reshape(-1)
+
+    pts = np.stack([col(fields["x"]), col(fields["y"]), col(fields["z"])], axis=1)
+    keep = np.isfinite(pts).all(axis=1) & (np.linalg.norm(pts, axis=1) > 0.1)
+    return pts[keep].astype(np.float64)
+
+
+def build_map_from_lidar(bag_path, lidar_topic, interp, voxel, stride):
+    from rosbags.highlevel import AnyReader
+    from rosbags.typesys import Stores, get_typestore
+    import open3d as o3d
+
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
+    acc = o3d.geometry.PointCloud()
+    i, used = 0, 0
+    with AnyReader([Path(bag_path)], default_typestore=typestore) as reader:
+        conns = [c for c in reader.connections if c.topic == lidar_topic]
+        if not conns:
+            raise SystemExit(f"LiDAR topic '{lidar_topic}' not in bag; can't build map.")
+        for conn, _, raw in tqdm(reader.messages(connections=conns), desc="building map"):
+            i += 1
+            if stride > 1 and (i % stride):
+                continue
+            msg = reader.deserialize(raw, conn.msgtype)
+            t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            T = interp.at(t)
+            if T is None:
+                continue
+            pts = decode_pointcloud2_xyz(msg)
+            if len(pts) == 0:
+                continue
+            pts_w = (T[:3, :3] @ pts.T).T + T[:3, 3]
+            p = o3d.geometry.PointCloud()
+            p.points = o3d.utility.Vector3dVector(pts_w)
+            acc += p
+            used += 1
+            if voxel > 0 and used % 50 == 0:      # keep memory bounded
+                acc = acc.voxel_down_sample(voxel)
+    if voxel > 0:
+        acc = acc.voxel_down_sample(voxel)
+    # clean: drop sparse outliers (reflective-floor ghosts, stray returns)
+    if len(acc.points) > 0:
+        acc, _ = acc.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    print(f"built map from {used} scans -> {len(acc.points)} points")
+    return acc
+
+
+# ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bag", required=True, help="ROS 2 bag directory")
     ap.add_argument("--traj", required=True, help="GLIM traj_lidar.txt")
     ap.add_argument("--out", required=True, help="output dataset directory")
     ap.add_argument("--map-ply", help="GLIM exported map .ply (init cloud)")
+    ap.add_argument("--build-map", action="store_true",
+                    help="build the init cloud from the bag's LiDAR + trajectory "
+                         "(no GLIM map export needed). Ignored if --map-ply is given.")
+    ap.add_argument("--lidar-topic", default="/ouster/points",
+                    help="PointCloud2 topic to build the init cloud from")
+    ap.add_argument("--map-stride", type=int, default=2,
+                    help="use every Nth LiDAR scan when building the map (speed/density)")
     ap.add_argument("--image-topic", default="/zed/zed_node/left/image_rect_color")
     ap.add_argument("--caminfo-topic", default="/zed/zed_node/left/camera_info")
     ap.add_argument("--min-baseline", type=float, default=0.05,
@@ -194,7 +264,7 @@ def main():
         frames=json_frames,
     )
 
-    # init point cloud from GLIM map
+    # init point cloud: either a GLIM-exported .ply, or built from the bag LiDAR
     if args.map_ply:
         dst = out / "map.ply"
         try:
@@ -209,6 +279,16 @@ def main():
         except Exception as e:
             print(f"open3d downsample failed ({e}); copying ply as-is")
             shutil.copy(args.map_ply, dst)
+        meta["ply_file_path"] = "map.ply"
+    elif args.build_map:
+        import open3d as o3d
+        pcd = build_map_from_lidar(args.bag, args.lidar_topic, interp,
+                                   args.voxel, args.map_stride)
+        if len(pcd.colors) == 0:  # nerfstudio's loader expects colors
+            pcd.paint_uniform_color([0.5, 0.5, 0.5])
+        dst = out / "map.ply"
+        o3d.io.write_point_cloud(str(dst), pcd)
+        print(f"init cloud: {len(pcd.points)} points -> {dst}")
         meta["ply_file_path"] = "map.ply"
 
     (out / "transforms.json").write_text(json.dumps(meta, indent=2))
