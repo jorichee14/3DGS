@@ -2,9 +2,6 @@
 *.db3
 *.mcap
 
-# Dataset resources (bags, maps, trajectories live on the robot, not in git)
-resources/
-
 # Converter output + training artifacts
 out/
 outputs/

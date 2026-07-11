@@ -1,0 +1,53 @@
+{
+  "camera": {
+    "camera_model": "rational_polynomial",
+    "distortion_coeffs": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "intrinsics": [
+      268.0818786621094,
+      268.0818786621094,
+      324.6055603027344,
+      177.1126251220703
+    ]
+  },
+  "meta": {
+    "bag_names": [
+      "scene_01",
+      "scene_02",
+      "scene_03"
+    ],
+    "camera_info_topic": "/zed/zed_node/left/camera_info",
+    "data_path": "/tmp/input_bags",
+    "image_topic": "/zed/zed_node/left/image_rect_color",
+    "intensity_channel": "reflectivity",
+    "points_topic": "/ouster/points"
+  },
+  "results": {
+    "T_lidar_camera": [
+      -0.07492821535373663,
+      -0.06697097901204006,
+      -0.09162651926397122,
+      -0.4978291081882739,
+      -0.4980354235251849,
+      0.501788779666838,
+      0.502329490031218
+    ],
+    "init_T_lidar_camera": [
+      -0.08572420477867126,
+      -0.06626002490520477,
+      -0.11988697946071625,
+      -0.49395568709333604,
+      -0.4990478750785723,
+      0.5015070896414501,
+      0.5054202428762279
+    ]
+  }
+}
