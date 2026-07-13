@@ -314,13 +314,16 @@ def main():
                          "(subsampling; 0 keeps everything)")
     ap.add_argument("--voxel", type=float, default=0.03,
                     help="voxel size (m) to downsample the init cloud; 0 disables")
+    ap.add_argument("--format", choices=["nerfstudio", "replica"], default="nerfstudio",
+                    help="output layout. 'nerfstudio' -> transforms.json + images/ (splatfacto). "
+                         "'replica' -> results/frameXXXXXX.jpg + traj.txt + cam_params.json "
+                         "(OpenGS-SLAM / MonoGS / Photo-SLAM / SGS-SLAM).")
     args = ap.parse_args()
 
     if bool(args.traj) == bool(args.odom_topic):
         raise SystemExit("Give exactly one pose source: --traj (GLIM) OR --odom-topic (camera-only).")
 
     out = Path(args.out)
-    (out / "images").mkdir(parents=True, exist_ok=True)
 
     frames, intr, img_frame = read_bag(args.bag, args.image_topic, args.caminfo_topic)
     if intr is None:
@@ -341,27 +344,45 @@ def main():
         print(f"odom child frame '{child_frame}', image frame '{img_frame}'")
         print(f"resolved body<-optical extrinsic:\n{np.round(ext, 4)}")
 
-    json_frames, last_pos, kept, skipped = [], None, 0, 0
+    # Pose each kept frame as T_world_cam (optical/OpenCV camera-to-world).
+    # This is format-agnostic: nerfstudio applies the OpenGL flip, replica does not.
+    kept_frames, last_pos, kept, skipped = [], None, 0, 0
     for t, img in tqdm(frames, desc="posing frames"):
         T_wl = interp.at(t)
         if T_wl is None:
             skipped += 1
             continue
-        c2w = T_wl @ ext @ OPTICAL_TO_OPENGL
+        T_wc = T_wl @ ext                       # world <- camera (optical)
         if last_pos is not None and args.min_baseline > 0:
-            if np.linalg.norm(c2w[:3, 3] - last_pos) < args.min_baseline:
+            if np.linalg.norm(T_wc[:3, 3] - last_pos) < args.min_baseline:
                 continue
-        last_pos = c2w[:3, 3]
-        name = f"images/{kept:06d}.png"
+        last_pos = T_wc[:3, 3]
+        kept_frames.append((img, T_wc))
+        kept += 1
+
+    if args.format == "replica":
+        write_replica(out, kept_frames, intr)
+    else:
+        write_nerfstudio(out, kept_frames, intr, interp, args)
+
+    print(f"\nkept {kept} frames, skipped {skipped} (outside trajectory).")
+    print(f"dataset -> {out}")
+
+
+def write_nerfstudio(out, kept_frames, intr, interp, args):
+    (out / "images").mkdir(parents=True, exist_ok=True)
+    json_frames = []
+    for i, (img, T_wc) in enumerate(kept_frames):
+        c2w = T_wc @ OPTICAL_TO_OPENGL           # ROS optical -> OpenGL
+        name = f"images/{i:06d}.png"
         Image.fromarray(img).save(out / name)
         json_frames.append({"file_path": name, "transform_matrix": c2w.tolist()})
-        kept += 1
 
     meta = dict(
         camera_model="OPENCV",
         fl_x=intr["fl_x"], fl_y=intr["fl_y"], cx=intr["cx"], cy=intr["cy"],
         w=intr["w"], h=intr["h"],
-        k1=0.0, k2=0.0, p1=0.0, p2=0.0,   # images are rectified
+        k1=0.0, k2=0.0, p1=0.0, p2=0.0,          # images are rectified
         frames=json_frames,
     )
 
@@ -373,7 +394,7 @@ def main():
             pcd = o3d.io.read_point_cloud(args.map_ply)
             if args.voxel > 0:
                 pcd = pcd.voxel_down_sample(args.voxel)
-            if len(pcd.colors) == 0:  # nerfstudio's loader expects colors
+            if len(pcd.colors) == 0:
                 pcd.paint_uniform_color([0.5, 0.5, 0.5])
             o3d.io.write_point_cloud(str(dst), pcd)
             print(f"init cloud: {len(pcd.points)} points -> {dst}")
@@ -385,7 +406,7 @@ def main():
         import open3d as o3d
         pcd = build_map_from_lidar(args.bag, args.lidar_topic, interp,
                                    args.voxel, args.map_stride)
-        if len(pcd.colors) == 0:  # nerfstudio's loader expects colors
+        if len(pcd.colors) == 0:
             pcd.paint_uniform_color([0.5, 0.5, 0.5])
         dst = out / "map.ply"
         o3d.io.write_point_cloud(str(dst), pcd)
@@ -393,13 +414,32 @@ def main():
         meta["ply_file_path"] = "map.ply"
 
     (out / "transforms.json").write_text(json.dumps(meta, indent=2))
-    print(f"\nkept {kept} frames, skipped {skipped} (outside trajectory).")
-    print(f"dataset -> {out}")
     if "ply_file_path" in meta:
         print(f"train:  ns-train splatfacto --data {out} "
               f"nerfstudio-data --load-3D-points True")
     else:
         print(f"train:  ns-train splatfacto --data {out}   # random init (no point cloud)")
+
+
+def write_replica(out, kept_frames, intr):
+    """Replica/TUM-style layout used by OpenGS-SLAM, MonoGS, Photo-SLAM, SGS-SLAM:
+    results/frameXXXXXX.jpg + traj.txt (row-major 4x4 c2w per line, OpenCV convention)
+    + cam_params.json. Poses are camera-to-world in the OpenCV optical frame (NO OpenGL flip)."""
+    (out / "results").mkdir(parents=True, exist_ok=True)
+    traj_lines = []
+    for i, (img, T_wc) in enumerate(tqdm(kept_frames, desc="writing replica")):
+        Image.fromarray(img).save(out / "results" / f"frame{i:06d}.jpg", quality=95)
+        traj_lines.append(" ".join(f"{v:.9f}" for v in np.asarray(T_wc).reshape(-1)))
+    (out / "traj.txt").write_text("\n".join(traj_lines) + "\n")
+    cam = dict(
+        fx=intr["fl_x"], fy=intr["fl_y"], cx=intr["cx"], cy=intr["cy"],
+        w=intr["w"], h=intr["h"],
+        png_depth_scale=6553.5,   # convention for RGB-D loaders (depth not exported here)
+        pose="c2w OpenCV (x-right, y-down, z-forward); traj.txt = one row-major 4x4 per line",
+        note="rectified/undistorted (zero distortion). Monocular RGB; add depth for RGB-D methods.",
+    )
+    (out / "cam_params.json").write_text(json.dumps(cam, indent=2))
+    print(f"replica layout -> {out}  (results/frame*.jpg, traj.txt, cam_params.json)")
 
 
 if __name__ == "__main__":

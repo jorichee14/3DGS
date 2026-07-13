@@ -48,9 +48,25 @@ scene/
   cam_params / config # fx, fy, cx, cy, W, H
 ```
 Our `glim_to_nerfstudio.py` already produces every ingredient (posed RGB frames +
-intrinsics). Adapting it = a **new `--format replica` output writer**: same pose math,
-different on-disk layout (`results/frameXXXXXX.jpg` + `traj.txt` + a cam config) instead of
-`transforms.json`. Poses from ZED odom / MASt3R-SLAM (camera-only, matches its modality).
+intrinsics). **✅ IMPLEMENTED:** `--format replica` writer — same pose math, Replica layout
+(`results/frameXXXXXX.jpg` + `traj.txt` + `cam_params.json`) instead of `transforms.json`.
+Poses from ZED odom (camera-only, matches its modality).
+
+```bash
+python3 glim_to_nerfstudio.py \
+  --bag  resources/mirc_dataset_calib_20260706/mirc_dataset_calib_20260706_merged \
+  --odom-topic /zed/zed_node/odom \
+  --out  ./out_replica \
+  --format replica \
+  --min-baseline 0.05
+# -> out_replica/{results/frameXXXXXX.jpg, traj.txt, cam_params.json}
+```
+
+`traj.txt` = one **row-major 4x4 c2w per line (16 values)**, **OpenCV** convention
+(x-right, y-down, z-forward — no OpenGL flip). `cam_params.json` carries fx/fy/cx/cy/w/h +
+`png_depth_scale`. This is the standard layout for MonoGS / Photo-SLAM / SGS-SLAM, so it's
+runnable on those **today**, and drop-in for OpenGS-SLAM when its loader ships (only the
+exact key names may need a tweak).
 
 **Semantic labels:** OpenGS-SLAM fuses 2D foundation-model labels — likely expects a
 `sam`/`semantic` mask folder per frame, or generates them internally. TBD until code drops.
